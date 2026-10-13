@@ -9,6 +9,7 @@ namespace Lively.Core.Suspend
         void Start();
         void Stop();
         IDisposable DeferPlayback();
+        bool CanReleaseVideoMemory(DisplayMonitor display);
 
         PlaybackPolicy WallpaperPlaybackPolicy { get; set; }
 

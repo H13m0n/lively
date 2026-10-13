@@ -10,6 +10,7 @@ using Lively.Common.Services;
 using Lively.Core.Display;
 using Lively.Core.Suspend;
 using Lively.Core.Watchdog;
+using Lively.Core.Wallpapers;
 using Lively.Factories;
 using Lively.Models;
 using Lively.Models.Enums;
@@ -34,6 +35,9 @@ namespace Lively.Core
         private static readonly NLog.Logger Logger = NLog.LogManager.GetCurrentClassLogger();
         private readonly SemaphoreSlim semaphoreSlimWallpaperLoadingLock = new(1, 1);
         private readonly List<IWallpaper> wallpapers = new(2);
+        private readonly WallpaperMemorySuspension<VideoResumeSnapshot> videoMemorySuspension = new();
+        private sealed record VideoResumeSnapshot(VideoMpvPlayer Wallpaper, float Percent);
+        private int? videoVolume;
         public ReadOnlyCollection<IWallpaper> Wallpapers => wallpapers.AsReadOnly();
         private IntPtr workerW, progman, shellDLL_DefView, original_WorkerW;
         public IntPtr DesktopWorkerW => workerW;
@@ -259,10 +263,20 @@ namespace Lively.Core
         /// </summary>
         public async Task SetWallpaperAsync(LibraryModel wallpaper, DisplayMonitor display)
         {
+            videoMemorySuspension.Invalidate();
+            await SetWallpaperCoreAsync(wallpaper, display);
+        }
+
+        private async Task<bool> SetWallpaperCoreAsync(LibraryModel wallpaper, DisplayMonitor display,
+            float? resumePercent = null, Func<bool> stillSelected = null)
+        {
             await semaphoreSlimWallpaperLoadingLock.WaitAsync();
 
             try
             {
+                if (disposedValue || stillSelected?.Invoke() == false)
+                    return false;
+
                 Logger.Info($"Setting wallpaper: {wallpaper.Title} | {wallpaper.FilePath}");
 
                 // Verify file exists if outside wallpaper install folder
@@ -272,7 +286,7 @@ namespace Lively.Core
                     Logger.Info($"Skipping wallpaper, file {wallpaper.LivelyInfo.FileName} not found.");
                     WallpaperError?.Invoke(this, new WallpaperNotFoundException($"{Properties.Resources.TextFileNotFound}\n{wallpaper.LivelyInfo.FileName}"));
                     WallpaperChanged?.Invoke(this, EventArgs.Empty);
-                    return;
+                    return false;
                 }
 
                 if (!watchdog.IsRunning)
@@ -293,8 +307,10 @@ namespace Lively.Core
 
                                 currentWallpaper = wallpaperFactory.CreateWallpaper(wallpaper, display, userSettings.Settings.WallpaperArrangement);
                                 currentWallpaper.Exited += Wallpaper_Exited;
-                                currentWallpaper.Loaded += Wallpaper_Loaded;
-                                await currentWallpaper.ShowAsync();
+                                if (!resumePercent.HasValue)
+                                    currentWallpaper.Loaded += Wallpaper_Loaded;
+                                if (!await ShowWallpaperAsync(currentWallpaper, resumePercent, stillSelected))
+                                    return false;
 
                                 if (!TrySetWallpaperPerScreen(currentWallpaper.Handle, currentWallpaper.Screen))
                                     Logger.Error("Failed to set wallpaper as child of WorkerW");
@@ -315,8 +331,10 @@ namespace Lively.Core
 
                                 currentWallpaper = wallpaperFactory.CreateWallpaper(wallpaper, display, userSettings.Settings.WallpaperArrangement);
                                 currentWallpaper.Exited += Wallpaper_Exited;
-                                currentWallpaper.Loaded += Wallpaper_Loaded;
-                                await currentWallpaper.ShowAsync();
+                                if (!resumePercent.HasValue)
+                                    currentWallpaper.Loaded += Wallpaper_Loaded;
+                                if (!await ShowWallpaperAsync(currentWallpaper, resumePercent, stillSelected))
+                                    return false;
 
                                 if (!TrySetWallpaperSpanScreen(currentWallpaper.Handle))
                                     Logger.Error("Failed to set wallpaper as child of WorkerW");
@@ -339,7 +357,8 @@ namespace Lively.Core
                                     currentWallpaper = wallpaperFactory.CreateWallpaper(wallpaper, item, userSettings.Settings.WallpaperArrangement);
                                     currentWallpaper.Exited += Wallpaper_Exited;
                                     currentWallpaper.Loaded += Wallpaper_Loaded;
-                                    await currentWallpaper.ShowAsync();
+                                    if (!await ShowWallpaperAsync(currentWallpaper, resumePercent, stillSelected))
+                                        return false;
 
                                     if (!TrySetWallpaperPerScreen(currentWallpaper.Handle, currentWallpaper.Screen))
                                         Logger.Error("Failed to set wallpaper as child of WorkerW");
@@ -367,6 +386,7 @@ namespace Lively.Core
                             break;
                     }
                     WallpaperChanged?.Invoke(this, EventArgs.Empty);
+                    return true;
                 }
                 catch (WallpaperPluginFactory.MsixNotAllowedException ex1)
                 {
@@ -395,11 +415,33 @@ namespace Lively.Core
 
                     currentWallpaper?.Dispose();
                 }
+                return false;
             }
             finally
             {
                 semaphoreSlimWallpaperLoadingLock.Release();
             }
+        }
+
+        private static async Task<bool> ShowWallpaperAsync(IWallpaper wallpaper, float? resumePercent, Func<bool> stillSelected)
+        {
+            await wallpaper.ShowAsync();
+            if (stillSelected?.Invoke() == false)
+            {
+                wallpaper.Dispose();
+                return false;
+            }
+
+            if (resumePercent.HasValue && wallpaper is VideoMpvPlayer mpv &&
+                !await mpv.RestorePlaybackPercentAsync(resumePercent.Value))
+                throw new InvalidOperationException("Failed to restore the suspended video's playback position.");
+
+            if (stillSelected?.Invoke() == false)
+            {
+                wallpaper.Dispose();
+                return false;
+            }
+            return true;
         }
 
         private async void Wallpaper_Loaded(object sender, EventArgs e)
@@ -622,6 +664,10 @@ namespace Lively.Core
         {
             lock (layoutWriteLock)
             {
+                // An automatic suspension is not an explicit removal, including during a failed restore.
+                if (videoMemorySuspension.Snapshot != null)
+                    return;
+
                 userSettings.WallpaperLayout.Clear();
                 wallpapers.ForEach(wallpaper =>
                 {
@@ -890,6 +936,10 @@ namespace Lively.Core
 
         public void CloseAllWallpapers()
         {
+            var wasSuspended = videoMemorySuspension.Snapshot != null;
+            videoMemorySuspension.Invalidate();
+            if (wasSuspended && Wallpapers.Count == 0)
+                WallpaperChanged?.Invoke(this, EventArgs.Empty);
             CloseAllWallpapers(fireEvent: true);
         }
 
@@ -912,6 +962,15 @@ namespace Lively.Core
 
         public void CloseWallpaper(DisplayMonitor display)
         {
+            var suspended = videoMemorySuspension.Snapshot;
+            if (suspended != null && suspended.Wallpaper.Screen.Equals(display))
+            {
+                videoMemorySuspension.Invalidate();
+                if (Wallpapers.Count == 0)
+                    WallpaperChanged?.Invoke(this, EventArgs.Empty);
+            }
+            else if (Wallpapers.Any(x => x.Screen.Equals(display)))
+                videoMemorySuspension.Invalidate();
             CloseWallpaper(display: display, fireEvent: true);
         }
 
@@ -937,6 +996,13 @@ namespace Lively.Core
 
         public void CloseWallpaper(WallpaperType type)
         {
+            var suspended = videoMemorySuspension.Snapshot;
+            if ((suspended != null && suspended.Wallpaper.Category == type) || wallpapers.Any(x => x.Category == type))
+            {
+                videoMemorySuspension.Invalidate();
+                if (suspended != null && wallpapers.Count == 0)
+                    WallpaperChanged?.Invoke(this, EventArgs.Empty);
+            }
             var tmp = wallpapers.FindAll(x => x.Category == type);
             if (tmp.Count > 0)
             {
@@ -955,6 +1021,14 @@ namespace Lively.Core
 
         public void CloseWallpaper(LibraryModel wp)
         {
+            var suspended = videoMemorySuspension.Snapshot;
+            if ((suspended != null && suspended.Wallpaper.Model.LivelyInfoFolderPath == wp.LivelyInfoFolderPath) ||
+                wallpapers.Any(x => x.Model.LivelyInfoFolderPath == wp.LivelyInfoFolderPath))
+            {
+                videoMemorySuspension.Invalidate();
+                if (suspended != null && wallpapers.Count == 0)
+                    WallpaperChanged?.Invoke(this, EventArgs.Empty);
+            }
             CloseWallpaper(wp: wp, fireEvent: true);
         }
 
@@ -1236,10 +1310,17 @@ namespace Lively.Core
             }
         }
 
-        private void Playback_WallpaperControlChanged(object sender, WallpaperControlEventArgs e)
+        private async void Playback_WallpaperControlChanged(object sender, WallpaperControlEventArgs e)
         {
             try
             {
+                if (e.Action == WallpaperControlAction.SetVolume)
+                {
+                    var volumeTarget = videoMemorySuspension.Snapshot?.Wallpaper ??
+                        (wallpapers.Count == 1 ? wallpapers[0] as VideoMpvPlayer : null);
+                    if (e.Display == null || (volumeTarget != null && volumeTarget.Screen.Equals(e.Display)))
+                        videoVolume = e.Volume;
+                }
                 foreach (var wallpaper in Wallpapers)
                 {
                     // Skip if targeting specific display and this isn't it
@@ -1259,11 +1340,78 @@ namespace Lively.Core
                             break;
                     }
                 }
+
+                if (e.Action != WallpaperControlAction.SetVolume)
+                    await UpdateVideoMemorySuspensionAsync(e);
             }
             catch (Exception ex)
             {
                 Logger.Error(ex);
             }
+        }
+
+        private async Task UpdateVideoMemorySuspensionAsync(WallpaperControlEventArgs e)
+        {
+            var suspended = videoMemorySuspension.Snapshot;
+            var video = suspended?.Wallpaper ?? (wallpapers.Count == 1 ? wallpapers[0] as VideoMpvPlayer : null);
+            if (video == null || video.Category != WallpaperType.video ||
+                userSettings.Settings.WallpaperArrangement == WallpaperArrangement.duplicate ||
+                (e.Display != null && !video.Screen.Equals(e.Display)))
+                return;
+
+            videoMemorySuspension.ObservePlayback(e.Action == WallpaperControlAction.Pause);
+            var delaySeconds = userSettings.Settings.VideoMemoryReleaseDelaySeconds;
+            bool IsHidden() => playback.CanReleaseVideoMemory(video.Screen);
+
+            if (suspended != null)
+            {
+                if (delaySeconds <= 0 || e.Action == WallpaperControlAction.Play || !IsHidden())
+                {
+                    if (await videoMemorySuspension.TryResumeAsync(RestoreSuspendedVideoAsync))
+                    {
+                        foreach (var restored in Wallpapers)
+                        {
+                            if (videoMemorySuspension.IsPaused)
+                                restored.Pause();
+                            else
+                                restored.Play();
+                            restored.SetVolume(videoVolume ?? userSettings.Settings.AudioVolumeGlobal);
+                        }
+                        Logger.Info("Restored suspended video wallpaper.");
+                        WallpaperChanged?.Invoke(this, EventArgs.Empty);
+                    }
+                }
+                return;
+            }
+
+            if (await videoMemorySuspension.TrySuspendAsync(TimeSpan.FromSeconds(Math.Max(0, delaySeconds)), IsHidden,
+                async () =>
+                {
+                    if (video.IsExited || wallpapers.Count != 1 || !ReferenceEquals(wallpapers[0], video))
+                        return null;
+                    var percent = await video.GetPlaybackPercentAsync();
+                    return percent.HasValue ? new VideoResumeSnapshot(video, percent.Value) : null;
+                }, snapshot =>
+                {
+                    // Retain the configured wallpaper entry for UI, display changes and restart commands.
+                    // Only its native process and GPU resources are released.
+                    if (snapshot.Wallpaper.Pid is int pid)
+                        watchdog.Remove(pid);
+                    snapshot.Wallpaper.Close();
+                    snapshot.Wallpaper.Dispose();
+                }))
+                Logger.Info("Released paused video wallpaper process while desktop is hidden.");
+        }
+
+        private Task<bool> RestoreSuspendedVideoAsync(VideoResumeSnapshot snapshot, Func<bool> stillSelected)
+        {
+            var display = displayManager.DisplayMonitors.FirstOrDefault(x => x.Equals(snapshot.Wallpaper.Screen));
+            if (userSettings.Settings.WallpaperArrangement == WallpaperArrangement.span)
+                display = displayManager.PrimaryDisplayMonitor;
+
+            return display == null
+                ? Task.FromResult(false)
+                : SetWallpaperCoreAsync(snapshot.Wallpaper.Model, display, snapshot.Percent, stillSelected);
         }
 
         private bool IsDesktop()
@@ -1287,6 +1435,8 @@ namespace Lively.Core
             {
                 if (disposing)
                 {
+                    videoMemorySuspension.Invalidate();
+                    playback.WallpaperControlChanged -= Playback_WallpaperControlChanged;
                     WallpaperChanged -= SetupDesktop_WallpaperChanged;
                     workerWHook?.Dispose();
                     CloseAllWallpapers(false);

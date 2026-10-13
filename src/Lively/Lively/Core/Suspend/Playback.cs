@@ -422,6 +422,32 @@ namespace Lively.Core.Suspend
             return false;
         }
 
+        /// <summary>
+        /// A paused wallpaper can still be visible on another monitor or behind a small focused window.
+        /// Only release it when every affected desktop is hidden, or the session cannot show it.
+        /// </summary>
+        public bool CanReleaseVideoMemory(DisplayMonitor display)
+        {
+            // DWM thumbnail screensavers still need the background player's live window.
+            if (screenSaver.IsRunning && screenSaver.Mode != ScreensaverApplyMode.process)
+                return false;
+
+            if (isLockScreen || (isRemoteSession && userSettings.Settings.RemoteDesktopPause == AppRules.pause) ||
+                (screenSaver.IsRunning && userSettings.Settings.ScreensaverType == ScreensaverType.wallpaper))
+                return true;
+
+            var windows = WindowUtil.GetVisibleTopLevelWindows();
+            windows.RemoveAll(WindowUtil.IsExcludedDesktopWindowClass);
+            var displays = userSettings.Settings.WallpaperArrangement == WallpaperArrangement.span
+                ? displayManager.DisplayMonitors.ToList()
+                : displayManager.DisplayMonitors.Where(x => x.Equals(display)).ToList();
+
+            // Use geometry rather than IsZoomed: a maximized window on one monitor must never
+            // qualify an uncovered second monitor in a spanned wallpaper.
+            return displays.Count > 0 && displays.All(screen =>
+                windows.Exists(hwnd => WindowUtil.IsWindowCoveringTarget(hwnd, screen.WorkingArea, threshold: 1.0)));
+        }
+
         private bool IsPauseRuleApp(IntPtr hwnd)
         {
             var result = false;

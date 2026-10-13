@@ -62,6 +62,12 @@ namespace Lively.Models
         /// </summary>
         public bool VideoPlayerHwAccel { get; set; }
         /// <summary>
+        /// Release a single local mpv video process after it has remained paused and fully hidden for
+        /// this many seconds. Zero disables the feature. Advanced setting; restoration may briefly show
+        /// the static Windows desktop background while the player starts.
+        /// </summary>
+        public int VideoMemoryReleaseDelaySeconds { get; set; }
+        /// <summary>
         /// Gif and picture wallpaper player.
         /// </summary>
         public LivelyGifPlayer GifPlayer { get; set; }
