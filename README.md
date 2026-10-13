@@ -4,6 +4,8 @@
   <h2 align="center">Lively Wallpaper</h2>
 </p>
 
+> Resource-efficiency fork based on v2.2.1.0: [changes, configuration and validation](RESOURCE_EFFICIENCY.md).
+
 [![GitHub release](https://img.shields.io/github/release/rocksdanister/lively/all.svg)](https://github.com/rocksdanister/lively/releases)
 [![Github all releases](https://img.shields.io/github/downloads/rocksdanister/lively/total.svg)](https://github.com/rocksdanister/lively/releases)
 [![GitHub stars](https://img.shields.io/github/stars/rocksdanister/lively.svg)](https://github.com/rocksdanister/lively/stargazers)

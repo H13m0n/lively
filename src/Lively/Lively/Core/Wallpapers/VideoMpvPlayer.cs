@@ -16,6 +16,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -44,6 +45,7 @@ namespace Lively.Core.Wallpapers
         private readonly Process process;
         private readonly int timeOut;
         private readonly string ipcServerName;
+        private readonly MpvPlaybackCommandCache playbackCommands;
         private bool isVideoStopped;
         private static int globalCount;
         private readonly int uniqueId;
@@ -82,6 +84,7 @@ namespace Lively.Core.Wallpapers
             LivelyPropertyCopyPath = livelyPropertyPath;
 
             ipcServerName = "mpvsocket" + Path.GetRandomFileName();
+            playbackCommands = new MpvPlaybackCommandCache(TrySendMessage);
             var configDir = GetConfigDir();
 
             var cmdArgs = new StringBuilder();
@@ -171,12 +174,12 @@ namespace Lively.Core.Wallpapers
                 //is this always the correct channel for main video?
                 SendMessage("{\"command\":[\"set_property\",\"vid\",1]}\n");
             }
-            SendMessage("{\"command\":[\"set_property\",\"pause\",false]}\n");
+            playbackCommands.SetPaused(false);
         }
 
         public void Pause()
         {
-            SendMessage("{\"command\":[\"set_property\",\"pause\",true]}\n");
+            playbackCommands.SetPaused(true);
         }
 
         //private void Stop()
@@ -190,7 +193,7 @@ namespace Lively.Core.Wallpapers
 
         public void SetVolume(int volume)
         {
-            SendMessage("{\"command\":[\"set_property\",\"volume\"," + JsonConvert.SerializeObject(volume) + "]}\n");
+            playbackCommands.SetVolume(volume);
         }
 
         public void SetMute(bool mute)
@@ -218,6 +221,46 @@ namespace Lively.Core.Wallpapers
                         break;
                 }
             }
+        }
+
+        internal async Task<float?> GetPlaybackPercentAsync()
+        {
+            var reply = await MpvJsonIpcClient.TryRequestAsync(ipcServerName, ["get_property", "percent-pos"]);
+            if (reply?.Success == true && reply.Data.ValueKind == JsonValueKind.Number &&
+                reply.Data.TryGetSingle(out var percent) && float.IsFinite(percent) && percent >= 0 && percent <= 100)
+                return percent;
+
+            return null;
+        }
+
+        internal async Task<bool> RestorePlaybackPercentAsync(float percent)
+        {
+            // Seek before the new window is embedded, with playback paused and startup volume still zero.
+            // Do not set --start: that would also change the beginning of subsequent loop iterations.
+            var pause = await MpvJsonIpcClient.TryRequestAsync(ipcServerName, ["set_property", "pause", true]);
+            var seek = pause?.Success == true
+                ? await MpvJsonIpcClient.TryRequestAsync(ipcServerName, ["seek", percent, "absolute-percent+exact"])
+                : null;
+            if (seek?.Success != true)
+                return false;
+
+            for (var attempt = 0; attempt < 20; attempt++)
+            {
+                var seeking = await MpvJsonIpcClient.TryRequestAsync(ipcServerName, ["get_property", "seeking"]);
+                if (seeking?.Success != true)
+                    return false;
+                if (seeking.Data.ValueKind == JsonValueKind.False)
+                {
+                    var position = await GetPlaybackPercentAsync();
+                    if (position.HasValue && Math.Abs(position.Value - percent) < 0.05f)
+                    {
+                        playbackCommands.Reset();
+                        return true;
+                    }
+                }
+                await Task.Delay(25);
+            }
+            return false;
         }
 
         private void SetLivelyProperties(string propertyPath)
@@ -357,6 +400,9 @@ namespace Lively.Core.Wallpapers
             process.OutputDataReceived -= Proc_OutputDataReceived;
             process?.Dispose();
             IsExited = true;
+            Pid = null;
+            Handle = IntPtr.Zero;
+            IsLoaded = false;
             Exited?.Invoke(this, EventArgs.Empty);
         }
 
@@ -382,14 +428,20 @@ namespace Lively.Core.Wallpapers
 
         private void SendMessage(string msg)
         {
+            TrySendMessage(msg);
+        }
+
+        private bool TrySendMessage(string msg)
+        {
             if (IsExited)
-                return;
+                return false;
 
             try
             {
                 PipeClient.SendMessage(ipcServerName, msg);
+                return true;
             }
-            catch { }
+            catch { return false; }
         }
 
         public void SendMessage(IpcMessage obj)
