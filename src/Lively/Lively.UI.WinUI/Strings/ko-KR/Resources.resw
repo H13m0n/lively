@@ -1298,4 +1298,7 @@ Edge는 Windows 10의 내장 웹뷰입니다.</value>
   <data name="SwitchReleaseBranchStable.Header" xml:space="preserve">
     <value>안정적인 릴리스로 전환</value>
   </data>
+  <data name="ForkAttribution.Content" xml:space="preserve">
+    <value>H13m0n의 최적화 포크 버전</value>
+  </data>
 </root>

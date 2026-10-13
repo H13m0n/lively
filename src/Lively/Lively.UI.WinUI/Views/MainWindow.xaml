@@ -15,7 +15,7 @@
     xmlns:toolkit="using:CommunityToolkit.WinUI.Controls"
     xmlns:ui="using:CommunityToolkit.WinUI"
     xmlns:winex="using:WinUIEx"
-    Title="Lively Wallpaper"
+    Title="Lively Wallpaper (H13m0n Fork)"
     Width="875"
     Height="875"
     MinWidth="700"
@@ -115,7 +115,7 @@
                 Margin="4,0,0,0"
                 VerticalAlignment="Center"
                 Style="{StaticResource CaptionTextBlockStyle}"
-                Text="Lively Wallpaper" />
+                Text="Lively · H13m0n Fork" />
             <AutoSuggestBox
                 x:Name="SearchBox"
                 x:Uid="SearchBox"
